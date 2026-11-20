@@ -1,5 +1,5 @@
 
-import { FormEvent, useState, useEffect } from 'react';
+import { FormEvent, useState, useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 import {
   doc,
@@ -908,6 +908,200 @@ function DeviceAlarmLog({ deviceId }: { deviceId: string }) {
   );
 }
 
+
+function LiveCameraFeed({ deviceId }: { deviceId: string }) {
+  const [wsBaseUrl, setWsBaseUrl] = useState('');
+  const [imageUrl, setImageUrl] = useState('');
+  const [connectionStatus, setConnectionStatus] = useState('Connecting...');
+  const imageUrlRef = useRef<string | null>(null);
+
+  // อ่าน WebSocket URL ล่าสุดจาก Firebase
+  useEffect(() => {
+    const unsubscribe = onSnapshot(
+      doc(db, 'SystemConfig', 'backend'),
+      snapshot => {
+        const data = snapshot.data();
+
+        if (data?.wsUrl) {
+          setWsBaseUrl(data.wsUrl);
+        } else {
+          setWsBaseUrl('');
+        }
+      },
+      error => {
+        console.error('Backend config error:', error);
+        setConnectionStatus('Backend unavailable');
+      }
+    );
+
+    return () => unsubscribe();
+  }, []);
+
+  // เชื่อมต่อ WebSocket และรับภาพจาก Backend
+  useEffect(() => {
+    if (!wsBaseUrl || !deviceId) {
+      setConnectionStatus('Waiting for backend...');
+      return;
+    }
+
+    let socket: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
+
+    const connect = () => {
+      if (stopped) return;
+
+      const url =
+        `${wsBaseUrl.replace(/\/$/, '')}/${encodeURIComponent(deviceId)}`;
+
+      setConnectionStatus('Connecting...');
+
+      socket = new WebSocket(url);
+      socket.binaryType = 'blob';
+
+      socket.onopen = () => {
+        setConnectionStatus('LIVE');
+        console.log('[Camera] Connected:', deviceId);
+      };
+
+      socket.onmessage = event => {
+        // Backend ส่ง JSON metadata และ binary JPEG แยกกัน
+        if (typeof event.data === 'string') {
+          try {
+            const metadata = JSON.parse(event.data);
+            console.log('[Camera] Metadata:', metadata);
+          } catch {
+            console.log('[Camera] Message:', event.data);
+          }
+          return;
+        }
+
+        if (event.data instanceof Blob) {
+          const nextUrl = URL.createObjectURL(event.data);
+
+          if (imageUrlRef.current) {
+            URL.revokeObjectURL(imageUrlRef.current);
+          }
+
+          imageUrlRef.current = nextUrl;
+          setImageUrl(nextUrl);
+          setConnectionStatus('LIVE');
+          return;
+        }
+
+        if (event.data instanceof ArrayBuffer) {
+          const nextUrl = URL.createObjectURL(
+            new Blob([event.data], { type: 'image/jpeg' })
+          );
+
+          if (imageUrlRef.current) {
+            URL.revokeObjectURL(imageUrlRef.current);
+          }
+
+          imageUrlRef.current = nextUrl;
+          setImageUrl(nextUrl);
+          setConnectionStatus('LIVE');
+        }
+      };
+
+      socket.onerror = error => {
+        console.error('[Camera] WebSocket error:', error);
+      };
+
+      socket.onclose = () => {
+        if (stopped) return;
+
+        setConnectionStatus('Reconnecting...');
+
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+
+      if (socket) {
+        socket.onclose = null;
+        socket.close();
+      }
+
+      if (imageUrlRef.current) {
+        URL.revokeObjectURL(imageUrlRef.current);
+        imageUrlRef.current = null;
+      }
+
+      setImageUrl('');
+    };
+  }, [wsBaseUrl, deviceId]);
+
+  return (
+    <div className="detail-feed" style={{
+      position: 'relative',
+      width: '100%',
+      minHeight: 280,
+      background: '#101817',
+      overflow: 'hidden',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center'
+    }}>
+      {imageUrl ? (
+        <img
+          src={imageUrl}
+          alt={`Live camera ${deviceId}`}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'contain'
+          }}
+        />
+      ) : (
+        <div style={{
+          color: '#9ca3af',
+          textAlign: 'center',
+          padding: 24,
+          zIndex: 1
+        }}>
+          <Icon name="camera" size={42}/>
+          <p>No camera image</p>
+          <small>{connectionStatus}</small>
+        </div>
+      )}
+
+      <div style={{
+        position: 'absolute',
+        top: 12,
+        left: 12,
+        zIndex: 2,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 7,
+        padding: '6px 10px',
+        borderRadius: 6,
+        background: 'rgba(0,0,0,.7)',
+        color: '#fff',
+        fontSize: 11
+      }}>
+        <i style={{
+          width: 7,
+          height: 7,
+          borderRadius: '50%',
+          background: connectionStatus === 'LIVE' ? '#22c55e' : '#f59e0b'
+        }}/>
+        {connectionStatus}
+      </div>
+    </div>
+  );
+}
+
 function DeviceDetail({ id, onBack, onEdit, devices }: { id: string; onBack: () => void; onEdit: () => void; devices: Device[] }) {
   const device = devices.find(item => item.id === id);
   if (!device) return <div className="empty-state"><Icon name="camera"/><b>Device not found</b><button className="outline-btn" onClick={onBack}>Back to devices</button></div>;
@@ -932,8 +1126,32 @@ function DeviceDetail({ id, onBack, onEdit, devices }: { id: string; onBack: () 
           <DeviceTelemetryChart deviceId={id}/>
         </div>
         <section className="panel live-detail">
-          <div className="panel-head"><div><h2>Live camera</h2><p>Camera stream integration pending</p></div><span className="live-badge"><i/>{state === 'Active' || state === 'Online' ? 'LIVE' : 'OFFLINE'}</span></div>
-          <div className="detail-feed"><div className="scan-line"/><div className="feed-data"><span>{device.people} people detected</span><b>{device.temperature === null ? '—' : `${device.temperature} °C`}</b></div></div>
+          <div className="panel-head">
+            <div>
+              <h2>Live camera</h2>
+              <p>Real-time camera feed · OpenCV / YOLO</p>
+            </div>
+            <span className="live-badge">
+              <i/>LIVE
+            </span>
+          </div>
+
+          <LiveCameraFeed
+            deviceId={device.thingsBoardId || device.id}
+          />
+
+          <div className="feed-data" style={{
+            display: 'flex',
+            justifyContent: 'space-between',
+            padding: '12px 16px'
+          }}>
+            <span>{device.people} people detected</span>
+            <b>
+              {device.temperature === null
+                ? '—'
+                : `${device.temperature} °C`}
+            </b>
+          </div>
         </section>
       </div>
       <DevicePeopleLog deviceId={id}/>
